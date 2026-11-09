@@ -1,0 +1,1 @@
+{ "indexes": [], "fieldOverrides": [{ "collectionGroup": "entries", "fieldPath": "diary", "indexes": [] }, { "collectionGroup": "entries", "fieldPath": "note", "indexes": [] }, { "collectionGroup": "entries", "fieldPath": "meals", "indexes": [] }] }
