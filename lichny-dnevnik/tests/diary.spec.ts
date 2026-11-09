@@ -10,6 +10,18 @@ async function login(page: Page) {
   await expect(page.getByLabel('Обычный дневник')).toBeEnabled();
 }
 async function saved(page: Page) { await expect(page.getByRole('status').filter({ hasText: /^Сохранено$/ })).toBeVisible(); }
+test('первый вход: одноразовая настройка аккаунта без работы с базой', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'Создайте личный вход' })).toBeVisible();
+  await page.getByLabel('Одноразовый код настройки').fill(process.env.TEST_SETUP_TOKEN!);
+  await page.getByLabel('Электронная почта').fill('owner@example.test');
+  await page.getByLabel('Пароль', { exact: true }).fill('Test-only-password-2026');
+  await page.getByRole('button', { name: 'Создать личный вход', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Как вы сегодня?' })).toBeVisible();
+  await page.getByRole('navigation', { name: 'Мобильное меню' }).getByRole('button', { name: 'Настройки' }).click();
+  await page.getByRole('button', { name: 'Выйти из аккаунта' }).click();
+  await expect(page.getByRole('button', { name: 'Войти в дневник' })).toBeVisible();
+});
 test('мобильный путь: вход → свободная запись → сервер → повторное открытие → изменение', async ({ page, browser }) => {
   const errors: string[] = []; page.on('pageerror', e => errors.push(e.message));
   await login(page);
@@ -68,14 +80,14 @@ test('история, пустые дни, стресс 0, резервная к
 test('обрыв связи: черновик переживает перезагрузку и отправляется повторно', async ({ page, context }) => {
   await login(page);
   await page.getByLabel('Обычный дневник').fill('Черновик до обрыва связи.');
-  await context.route('**/v1/projects/demo-tiho/databases/**', route => route.abort());
+  await context.route('**/api/entries**', route => route.abort());
   await page.getByRole('button', { name: 'Сохранить запись', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Не отправлено');
   await expect(page.getByRole('status')).not.toContainText('Сохранено');
   await page.reload();
   await expect(page.getByLabel('Обычный дневник')).toHaveValue('Черновик до обрыва связи.');
   await expect(page.getByLabel('Обычный дневник')).toBeEnabled();
-  await context.unroute('**/v1/projects/demo-tiho/databases/**');
+  await context.unroute('**/api/entries**');
   await page.getByRole('button', { name: 'Повторить отправку' }).click(); await saved(page);
   await page.reload(); await expect(page.getByLabel('Обычный дневник')).toHaveValue('Черновик до обрыва связи.'); await saved(page);
   await page.evaluate(() => navigator.serviceWorker.ready);
@@ -92,7 +104,7 @@ test('обрыв связи: черновик переживает переза�
 test('ожидание ответа сервера не показывает «Сохранено»', async ({ page, context }) => {
   await login(page); await page.getByLabel('Обычный дневник').fill('Ждём сервер.');
   let release: (() => void) | undefined;
-  await context.route('**/documents:commit', async route => { await new Promise<void>(r => { release = r; }); await route.continue(); });
+  await context.route('**/api/entries/*', async route => { if (route.request().method() !== 'PUT') { await route.continue(); return; } await new Promise<void>(r => { release = r; }); await route.continue(); });
   await page.getByRole('button', { name: 'Сохранить запись', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Отправляем на сервер');
   await expect(page.getByRole('status')).not.toContainText('Сохранено');
@@ -113,25 +125,59 @@ test('конфликт устройств сохраняет локальные 
 test('потерянный ответ после записи: повтор не создаёт вторую серверную версию', async ({ page, context }) => {
   await login(page); await page.getByLabel('Обычный дневник').fill('Ответ потерялся, запись дошла.');
   let commits = 0;
-  await context.route('**/documents:commit', async route => {
+  await context.route('**/api/entries/*', async route => {
+    if (route.request().method() !== 'PUT') { await route.continue(); return; }
     commits++; await route.fetch(); await route.abort();
   });
   await page.getByRole('button', { name: 'Сохранить запись', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Не отправлено');
   await page.getByRole('button', { name: 'Повторить отправку' }).click(); await saved(page);
   expect(commits).toBe(1);
-  await context.unroute('**/documents:commit');
+  await context.unroute('**/api/entries/*');
   await page.reload(); await expect(page.getByLabel('Обычный дневник')).toHaveValue('Ответ потерялся, запись дошла.');
 });
-test('сервер запрещает анонимные и чужие чтения/запись, проверяет значения', async ({ request }) => {
-  const doc = `http://127.0.0.1:8080/v1/projects/demo-tiho/databases/(default)/documents/users/test-owner/entries/${today()}`;
-  expect((await request.get(doc)).status()).toBe(403);
-  async function token(email: string) { const r = await request.post('http://127.0.0.1:9099/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=demo-key', { data: { email, password: 'Test-only-password-2026', returnSecureToken: true } }); return (await r.json()).idToken; }
-  const other = await token('other@example.test');
-  expect((await request.get(doc, { headers: { Authorization: `Bearer ${other}` } })).status()).toBe(403);
-  expect((await request.patch(doc, { headers: { Authorization: `Bearer ${other}` }, data: { fields: { diary: { stringValue: 'intrusion' } } } })).status()).toBe(403);
-  expect((await request.delete(doc, { headers: { Authorization: `Bearer ${other}` } })).status()).toBe(403);
-  const owner = await token('owner@example.test');
-  expect((await request.get(doc, { headers: { Authorization: `Bearer ${owner}` } })).status()).toBe(200);
-  expect((await request.patch(doc, { headers: { Authorization: `Bearer ${owner}` }, data: { fields: { stress: { integerValue: '99' } } } })).status()).toBe(403);
+test('резервная копия: восстановление на телефоне, два режима и отказ от повреждённого файла', async ({ page }) => {
+  await login(page);
+  const menu = page.getByRole('navigation', { name: 'Мобильное меню' });
+  await menu.getByRole('button', { name: 'История' }).click();
+  await page.getByLabel('Дата записи', { exact: true }).fill('2026-02-10');
+  await expect(page.getByLabel('Обычный дневник')).toBeEnabled();
+  await page.getByLabel('Обычный дневник').fill('Запись для восстановления.');
+  await page.getByRole('button', { name: 'Сохранить запись', exact: true }).click(); await saved(page);
+  await menu.getByRole('button', { name: 'Настройки' }).click();
+  const dlEvent = page.waitForEvent('download'); await page.getByRole('button', { name: 'Скачать все записи' }).click();
+  const copy = await readFile((await (await dlEvent).path())!);
+  await menu.getByRole('button', { name: 'История' }).click();
+  page.once('dialog', d => d.accept()); await page.getByRole('button', { name: 'Удалить запись за этот день' }).click();
+  await expect(page.getByRole('status')).toContainText('Запись удалена');
+  await menu.getByRole('button', { name: 'Настройки' }).click();
+  await page.getByLabel('Файл резервной копии').setInputFiles({ name: 'backup.json', mimeType: 'application/json', buffer: copy });
+  await expect(page.getByRole('button', { name: 'Восстановить записи', exact: true })).toBeVisible();
+  page.once('dialog', d => d.dismiss()); await page.getByRole('button', { name: 'Восстановить записи', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Восстановить записи', exact: true })).toBeVisible();
+  page.once('dialog', d => d.accept()); await page.getByRole('button', { name: 'Восстановить записи', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Сервер подтвердил восстановление' })).toBeVisible();
+  await menu.getByRole('button', { name: 'История' }).click();
+  await expect(page.getByLabel('Обычный дневник')).toHaveValue('Запись для восстановления.');
+  await page.getByLabel('Обычный дневник').fill('Изменено после копии.');
+  await page.getByRole('button', { name: 'Сохранить запись', exact: true }).click(); await saved(page);
+  await menu.getByRole('button', { name: 'Настройки' }).click();
+  await page.getByLabel('Файл резервной копии').setInputFiles({ name: 'backup-again.json', mimeType: 'application/json', buffer: copy });
+  await page.getByLabel('Как восстановить').selectOption('replace');
+  page.once('dialog', d => d.accept()); await page.getByRole('button', { name: 'Восстановить записи', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Сервер подтвердил восстановление' })).toBeVisible();
+  await page.screenshot({ path: 'test-results/mobile-restore.png', fullPage: true });
+  await page.getByLabel('Файл резервной копии').setInputFiles({ name: 'broken.json', mimeType: 'application/json', buffer: Buffer.from('{broken') });
+  await expect(page.getByRole('alert')).toContainText('Не удалось прочитать JSON');
+  await menu.getByRole('button', { name: 'История' }).click();
+  await expect(page.getByLabel('Обычный дневник')).toHaveValue('Запись для восстановления.');
+});
+test('защищены вход, резервная копия и восстановление; cookie закрыта от JavaScript', async ({ page, request }) => {
+  expect((await request.get('/api/entries')).status()).toBe(401);
+  expect((await request.get('/api/backup')).status()).toBe(401);
+  expect((await request.post('/api/restore', { headers: { Origin: 'http://127.0.0.1:5173' }, data: {} })).status()).toBe(401);
+  expect((await request.post('/api/login', { headers: { Origin: 'http://127.0.0.1:5173' }, data: { email: 'other@example.test', password: 'Test-only-password-2026' } })).status()).toBe(401);
+  await login(page);
+  expect(await page.evaluate(() => document.cookie)).not.toContain('tiho_session');
+  const cookies = await page.context().cookies(); expect(cookies.find(c => c.name === 'tiho_session')?.httpOnly).toBeTruthy();
 });
