@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from server.app import create_app
-from server.storage import connect, initialize
+from server.storage import connect, initialize, prepare_setup
 
 
 class ServerTests(unittest.TestCase):
@@ -68,6 +68,28 @@ class ServerTests(unittest.TestCase):
             self.assertNotIn('Strong-test-password', stored)
             raw_token = self.cookie.split('=')[1]
             self.assertNotEqual(db.execute('SELECT token_hash FROM sessions').fetchone()[0], raw_token)
+
+    def test_repeated_setup_resumes_onboarding_without_resetting_owner_or_records(self):
+        site_id = self.app.config['siteId']
+        resumed = prepare_setup(self.data, 'http://127.0.0.1:8000')
+        self.assertTrue(resumed['existing'])
+        self.assertFalse(resumed['account_created'])
+        self.assertEqual(resumed['origin'], 'https://diary.example')
+        self.assertNotEqual(resumed['token'], self.token)
+        # The already running server accepts the new token and rejects the old one.
+        payload = {'email': 'owner@example.test', 'password': 'Strong-test-password-2026', 'setupToken': self.token}
+        self.assertEqual(self.call('/api/setup', 'POST', payload)[0], 403)
+        self.token = resumed['token']
+        self.setup_owner()
+        record = self.save()
+        stored_config = (self.data / 'config.json').read_bytes()
+        existing = prepare_setup(self.data, 'http://127.0.0.1:8000')
+        self.assertTrue(existing['account_created'])
+        self.assertIsNone(existing['token'])
+        self.assertEqual((self.data / 'config.json').read_bytes(), stored_config)
+        self.assertEqual(self.call('/api/session')[1]['user']['uid'], site_id)
+        self.assertEqual(self.call('/api/entries/2026-11-09')[1]['entry'], record)
+        self.assertEqual(self.call('/api/login', 'POST', {'email': 'owner@example.test', 'password': 'Strong-test-password-2026'})[0], 200)
 
     def test_anonymous_csrf_and_cross_site_are_denied(self):
         self.setup_owner()

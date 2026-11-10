@@ -181,3 +181,88 @@ test('защищены вход, резервная копия и восстан
   expect(await page.evaluate(() => document.cookie)).not.toContain('tiho_session');
   const cookies = await page.context().cookies(); expect(cookies.find(c => c.name === 'tiho_session')?.httpOnly).toBeTruthy();
 });
+test('пауза на телефоне: три реальных звука, громкость, таймер и запись под дождь', async ({ page }) => {
+  const errors: string[] = []; const external: string[] = [];
+  page.on('pageerror', e => errors.push(e.message));
+  page.on('request', r => { if (!r.url().startsWith('http://127.0.0.1:5173')) external.push(r.url()); });
+  await page.addInitScript(() => {
+    const observed = window as any;
+    observed.__soundContexts = []; observed.__soundAnalyser = null;
+    const connect = AudioNode.prototype.connect;
+    AudioNode.prototype.connect = function(...args: any[]) {
+      const result = Reflect.apply(connect, this, args);
+      if (args[0] === this.context.destination && this.context instanceof AudioContext) {
+        const analyser = this.context.createAnalyser(); analyser.fftSize = 2048;
+        Reflect.apply(connect, this, [analyser]); observed.__soundAnalyser = analyser;
+        if (!observed.__soundContexts.includes(this.context)) observed.__soundContexts.push(this.context);
+      }
+      return result;
+    } as typeof connect;
+  });
+  const level = () => page.evaluate(() => {
+    const analyser = (window as any).__soundAnalyser as AnalyserNode | null;
+    if (!analyser) return 0;
+    const data = new Float32Array(analyser.fftSize); analyser.getFloatTimeDomainData(data);
+    return Math.max(...data.map(n => Math.abs(n)));
+  });
+  await login(page);
+  await page.getByRole('button', { name: /Сделать паузу/ }).click();
+  await expect(page.getByRole('heading', { name: 'Небольшая пауза' })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__soundContexts.length)).toBe(0);
+  await page.getByRole('button', { name: 'Включить звук', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Выключить звук', exact: true })).toBeVisible();
+  await expect.poll(level).toBeGreaterThan(0.0001);
+  const volume = page.getByRole('slider', { name: 'Громкость звука' });
+  await volume.focus(); await volume.press('Home'); await expect(volume).toHaveValue('0');
+  await expect.poll(level).toBeLessThan(0.00001);
+  await volume.press('End'); await volume.press('ArrowLeft'); await volume.press('ArrowLeft');
+  await expect.poll(level).toBeGreaterThan(0.0001);
+  for (const name of ['Морские волны', 'Тихие ноты', 'Мягкий дождь']) {
+    await page.getByRole('button', { name: new RegExp(`^${name}`) }).click();
+    await expect(page.getByRole('button', { name: 'Выключить звук', exact: true })).toBeEnabled();
+    await expect.poll(level).toBeGreaterThan(0.0001);
+  }
+  await page.getByRole('button', { name: '20 мин', exact: true }).click();
+  await expect(page.getByRole('button', { name: '20 мин', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await page.screenshot({ path: 'test-results/mobile-calm.png', fullPage: true });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  await page.getByRole('navigation', { name: 'Мобильное меню' }).getByRole('button', { name: 'Сегодня' }).click();
+  await expect(page.getByRole('button', { name: 'Выключить фоновый звук' })).toBeVisible();
+  await page.getByLabel('Обычный дневник').fill('Пишу под тихий дождь.');
+  await page.getByRole('button', { name: 'Сохранить запись', exact: true }).click(); await saved(page);
+  await page.getByRole('button', { name: 'Выключить фоновый звук' }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__soundContexts.every((c: AudioContext) => c.state === 'closed'))).toBeTruthy();
+  await page.reload(); await expect(page.getByLabel('Обычный дневник')).toHaveValue('Пишу под тихий дождь.');
+  expect(await page.evaluate(() => (window as any).__soundContexts.length)).toBe(0);
+  const menu = page.getByRole('navigation', { name: 'Мобильное меню' });
+  await menu.getByRole('button', { name: 'Пауза', exact: true }).click();
+  await page.clock.install();
+  await page.getByRole('button', { name: '5 мин', exact: true }).click();
+  await page.getByRole('button', { name: 'Включить звук', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Выключить звук', exact: true })).toBeVisible();
+  await page.clock.fastForward(300_100);
+  await expect(page.getByRole('button', { name: 'Включить звук', exact: true })).toBeVisible();
+  await page.clock.resume();
+  await page.getByRole('button', { name: 'Включить звук', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Выключить звук', exact: true })).toBeVisible();
+  await menu.getByRole('button', { name: 'Настройки' }).click();
+  await page.getByRole('button', { name: 'Выйти из аккаунта' }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__soundContexts.every((c: AudioContext) => c.state === 'closed'))).toBeTruthy();
+  expect(external).toEqual([]); expect(errors).toEqual([]);
+});
+test('пауза работает офлайн: звук и необязательные шаги самопомощи', async ({ page, context }) => {
+  await login(page); await page.evaluate(() => navigator.serviceWorker.ready);
+  await context.setOffline(true);
+  await page.getByRole('navigation', { name: 'Мобильное меню' }).getByRole('button', { name: 'Пауза', exact: true }).click();
+  await page.getByRole('button', { name: 'Включить звук', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Выключить звук', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: /Попробовать четыре шага/ }).click();
+  await expect(page.getByRole('heading', { name: 'Почувствуйте опору' })).toBeVisible();
+  for (let step = 0; step < 3; step++) await page.getByRole('button', { name: 'Дальше', exact: true }).click();
+  await page.getByRole('button', { name: 'Завершить', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Пусть дальше будет чуть бережнее' })).toBeVisible();
+  await page.getByRole('button', { name: /Перейти к дневнику/ }).click();
+  await expect(page.getByRole('heading', { name: 'Как вы сегодня?' })).toBeVisible();
+  await page.getByRole('button', { name: 'Выключить фоновый звук' }).click();
+  await context.setOffline(false);
+});

@@ -161,7 +161,8 @@ class App:
                 if owner:
                     raise Problem(403, 'Личный вход уже создан. Регистрация закрыта.')
                 token = data.get('setupToken', '')
-                if not isinstance(token, str) or not hmac.compare_digest(digest(token), self.config['bootstrapHash']):
+                current_setup_hash = json.loads((self.directory / 'config.json').read_text(encoding='utf-8'))['bootstrapHash']
+                if not isinstance(token, str) or not hmac.compare_digest(digest(token), current_setup_hash):
                     raise Problem(403, 'Неверный одноразовый код настройки.')
                 if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email) or len(password) < 12:
                     raise Problem(400, 'Введите почту и пароль длиной от 12 символов.')
@@ -170,6 +171,9 @@ class App:
                 with transaction(db):
                     if db.execute('SELECT id FROM owner').fetchone():
                         raise Problem(403, 'Личный вход уже создан.')
+                    current_setup_hash = json.loads((self.directory / 'config.json').read_text(encoding='utf-8'))['bootstrapHash']
+                    if not hmac.compare_digest(digest(token), current_setup_hash):
+                        raise Problem(403, 'Код настройки изменился. Используйте последний код из терминала.')
                     db.execute('INSERT INTO owner VALUES(1,?,?,?)', (email, salt, hashed))
                     db.execute('DELETE FROM attempts WHERE key=?', (digest(env.get('REMOTE_ADDR', 'unknown')),))
                     result = self.new_session(db, {'email': email})

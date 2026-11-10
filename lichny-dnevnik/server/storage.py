@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import secrets
 import sqlite3
+import tempfile
 from contextlib import contextmanager, closing
 from urllib.parse import urlsplit
 
@@ -101,6 +102,39 @@ def connect(directory):
     db.execute('PRAGMA foreign_keys=ON')
     # Use a rollback journal on the persistent local filesystem, with full sync.
     return db
+
+
+def prepare_setup(directory, origin):
+    """Initialize once, or resume onboarding without replacing the data file."""
+    directory = Path(directory).resolve()
+    config_path = directory / 'config.json'
+    database_path = directory / 'diary.sqlite3'
+    if not config_path.exists() and not database_path.exists():
+        token = initialize(directory, origin)
+        return {'token': token, 'origin': validate_origin(origin), 'existing': False, 'account_created': False}
+    if not config_path.is_file() or not database_path.is_file():
+        raise ValueError('Найдены неполные данные настройки. Файлы оставлены без изменений; требуется проверить папку данных.')
+    config = json.loads(config_path.read_text(encoding='utf-8'))
+    with closing(connect(directory)) as db, transaction(db):
+        if db.execute('PRAGMA user_version').fetchone()[0] != 1:
+            raise ValueError('Неподдерживаемая версия базы. Данные оставлены без изменений.')
+        if db.execute('SELECT id FROM owner WHERE id=1').fetchone():
+            return {'token': None, 'origin': config['origin'], 'existing': True, 'account_created': True}
+        token = secrets.token_urlsafe(32)
+        config['bootstrapHash'] = digest(token)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=directory, prefix='.setup-', suffix='.tmp', delete=False) as f:
+                temporary_path = Path(f.name)
+                json.dump(config, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary_path, config_path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        db.execute('DELETE FROM attempts')
+    return {'token': token, 'origin': config['origin'], 'existing': True, 'account_created': False}
 
 
 @contextmanager

@@ -7,7 +7,7 @@ from contextlib import closing
 from wsgiref.simple_server import make_server
 
 from .app import create_app
-from .storage import connect, data_directory, initialize, password_hash, transaction
+from .storage import connect, data_directory, password_hash, prepare_setup, transaction
 
 
 def main():
@@ -21,10 +21,21 @@ def main():
     if args.command == 'init':
         if not args.origin:
             parser.error('Нужен --origin https://имя.alwaysdata.net')
-        token = initialize(args.data_dir, args.origin)
-        print('Дневник подготовлен. SQLite создан автоматически вне папки кода.')
+        try:
+            setup = prepare_setup(args.data_dir, args.origin)
+        except (ValueError, OSError) as error:
+            parser.exit(1, f'Настройка не выполнена: {error}\n')
+        if setup['account_created']:
+            print('Личный вход уже создан. Существующие записи и пароль сохранены.')
+            print(f"Запустите сайт командой npm.cmd start и откройте {setup['origin']}")
+            print('Войдите с ранее заданной почтой и паролем.')
+            return
+        print('Дневник уже подготовлен. Данные сохранены; выдан новый код настройки.' if setup['existing'] else 'Дневник подготовлен. SQLite создан автоматически вне папки кода.')
         print('Откройте сайт и создайте личный вход. Одноразовый код настройки:')
-        print(token)
+        print(setup['token'])
+        print(f"Адрес сайта: {setup['origin']}")
+        if setup['existing']:
+            print('Предыдущий одноразовый код больше не действует.')
         print('После создания входа код больше не работает. Сохраните свой пароль.')
     elif args.command == 'serve':
         app = create_app(args.data_dir, args.static)
