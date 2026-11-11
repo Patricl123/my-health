@@ -48,12 +48,15 @@ try {
   const login = await fetch('http://127.0.0.1:5173/api/login', { method: 'POST', headers: { Origin: 'http://127.0.0.1:5173', 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'owner@example.test', password: 'Test-only-password-2026' }) });
   assert.equal(login.status, 200); const session = await login.json(); const cookie = login.headers.get('set-cookie').split(';')[0];
   const before = await (await fetch('http://127.0.0.1:5173/api/entries', { headers: { Cookie: cookie } })).json();
+  const helpersBefore = await (await fetch('http://127.0.0.1:5173/api/helpers', { headers: { Cookie: cookie } })).json();
   await stop(server);
   const newRelease = path.join(runtime, 'updated-release'); await cp('dist', newRelease, { recursive: true });
   server = start(pythonExe, ['-m', 'server.manage', 'serve', '--data-dir', dataDir, '--port', '5173', '--static', newRelease], true);
   await waitFor(server);
   const after = await (await fetch('http://127.0.0.1:5173/api/entries', { headers: { Cookie: cookie } })).json();
   assert.deepEqual(after, before);
+  const helpersAfter = await (await fetch('http://127.0.0.1:5173/api/helpers', { headers: { Cookie: cookie } })).json();
+  assert.deepEqual(helpersAfter, helpersBefore);
   const active = await (await fetch('http://127.0.0.1:5173/api/session', { headers: { Cookie: cookie } })).json();
   assert.equal(active.user.email, session.user.email);
   console.log('OK: реальный перезапуск сервера и замена папки сайта сохранили записи и личный вход.');

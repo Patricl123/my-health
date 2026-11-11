@@ -93,9 +93,9 @@ class ServerTests(unittest.TestCase):
 
     def test_anonymous_csrf_and_cross_site_are_denied(self):
         self.setup_owner()
-        for path in ['/api/entries', '/api/entries/2026-11-09', '/api/backup']:
+        for path in ['/api/entries', '/api/entries/2026-11-09', '/api/backup', '/api/helpers']:
             self.assertEqual(self.call(path, auth=False)[0], 401)
-        for path, method in [('/api/entries/2026-11-09', 'PUT'), ('/api/restore', 'POST'), ('/api/restore/preview', 'POST')]:
+        for path, method in [('/api/entries/2026-11-09', 'PUT'), ('/api/restore', 'POST'), ('/api/restore/preview', 'POST'), ('/api/helpers', 'PUT')]:
             self.assertEqual(self.call(path, method, {}, auth=False)[0], 401)
             self.assertEqual(self.call(path, method, {}, csrf=False)[0], 403)
             self.assertEqual(self.call(path, method, {}, origin='https://attacker.example')[0], 403)
@@ -168,6 +168,93 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(self.call('/api/login', 'POST', {'email': 'owner@example.test', 'password': 'wrong'})[0], 401)
         restarted = create_app(self.data)
         self.assertEqual(self.call('/api/login', 'POST', {'email': 'owner@example.test', 'password': 'wrong'}, app=restarted)[0], 429)
+
+    def test_upgrade_from_original_database_keeps_owner_records_and_sessions(self):
+        self.setup_owner()
+        record = self.save()
+        with closing(connect(self.data)) as db:
+            db.execute('DROP TABLE helpers')
+            db.execute('PRAGMA user_version=1')
+            # Represent a genuinely old payload, which has none of the new fields.
+            db.execute('UPDATE entries SET payload=?', (json.dumps(self.entry()),))
+        updated = create_app(self.data)
+        self.assertEqual(self.call('/api/entries/2026-11-09', app=updated)[1]['entry'], record)
+        self.assertEqual(self.call('/api/session', app=updated)[1]['user']['email'], 'owner@example.test')
+        self.assertIsNone(self.call('/api/helpers', app=updated)[1]['helpers'])
+        create_app(self.data)  # Repeating the upgrade is harmless.
+        self.assertTrue(prepare_setup(self.data, 'https://diary.example')['account_created'])
+
+    def test_new_entry_fields_round_trip_and_invalid_values_do_not_write(self):
+        self.setup_owner()
+        entry = dict(self.entry(), diary='', tags=['Работа', 'Тяжёлый день'], sleepHours=7.5, energy=0)
+        saved = self.save(entry)
+        self.assertEqual(saved['tags'], entry['tags'])
+        self.assertEqual(saved['sleepHours'], 7.5)
+        self.assertEqual(saved['energy'], 0)
+        for patch in [{'tags': ['A', 'a']}, {'tags': ['x' * 33]}, {'tags': ['']}, {'tags': 'Работа'},
+                      {'sleepHours': -1}, {'sleepHours': 25}, {'sleepHours': True}, {'sleepHours': 7.3},
+                      {'energy': -1}, {'energy': 11}, {'energy': True}, {'energy': 1.5}]:
+            code, _, _ = self.call('/api/entries/' + entry['date'], 'PUT', {
+                'entry': dict(entry, **patch), 'revision': saved['revision'], 'mutationId': secrets.token_hex(16)})
+            self.assertEqual(code, 400, patch)
+        self.assertEqual(self.call('/api/entries/' + entry['date'])[1]['entry'], saved)
+        self.assertEqual(self.save(dict(entry, sleepHours=0), saved['revision'])['sleepHours'], 0)
+
+    def test_helpers_conflict_idempotency_restart_and_backup(self):
+        self.setup_owner()
+        payload = {'items': ['Тёплый душ', 'Прогулка'], 'revision': None, 'mutationId': secrets.token_hex(16)}
+        code, first, _ = self.call('/api/helpers', 'PUT', payload)
+        self.assertEqual(code, 200)
+        self.assertEqual(self.call('/api/helpers', 'PUT', payload)[1], first)
+        self.assertEqual(self.call('/api/helpers', 'PUT', dict(payload, mutationId=secrets.token_hex(16)))[0], 409)
+        for items in [[''], ['x' * 201], ['x'] * 31, 'Прогулка', [True]]:
+            self.assertEqual(self.call('/api/helpers', 'PUT', dict(payload, items=items))[0], 400)
+        self.assertEqual(self.call('/api/helpers', app=create_app(self.data))[1], first)
+        copy = self.call('/api/backup')[1]
+        self.assertEqual(copy['formatVersion'], 3)
+        self.assertEqual(copy['helpers'], payload['items'])
+        self.assertNotIn('password', json.dumps(copy))
+        # An empty list is a real, revisioned update, so an old phone cannot resurrect it.
+        clear = dict(payload, items=[], revision=first['helpers']['revision'], mutationId=secrets.token_hex(16))
+        self.assertEqual(self.call('/api/helpers', 'PUT', clear)[1]['helpers']['items'], [])
+
+    def test_helpers_restore_merge_replace_legacy_and_atomic_failure(self):
+        self.setup_owner()
+        entry = dict(self.entry(), sleepHours=8, energy=4, tags=['Отдых'])
+        self.save(entry)
+        def helper(items, revision=None):
+            return self.call('/api/helpers', 'PUT', {'items': items, 'revision': revision, 'mutationId': secrets.token_hex(16)})[1]['helpers']
+        def restore(copy, mode='replace', failure=False):
+            preview = self.call('/api/restore/preview', 'POST', {'backup': copy})[1]
+            data = dict(backup=copy, mode=mode, expectedGeneration=preview['generation'], operationId=secrets.token_hex(16))
+            if failure:
+                with patch('server.app.bump', side_effect=sqlite3.OperationalError('injected')):
+                    return self.call('/api/restore', 'POST', data)
+            return self.call('/api/restore', 'POST', data)
+        original = helper(['Чай'])
+        copy = self.call('/api/backup')[1]
+        helper(['Прогулка'], original['revision'])
+        before = self.call('/api/backup')[1]
+        self.assertEqual(restore(copy, failure=True)[0], 503)
+        after = self.call('/api/backup')[1]
+        self.assertEqual(after['helpers'], before['helpers'])
+        self.assertEqual(after['entries'], before['entries'])
+        self.assertEqual(restore(copy, 'merge')[0], 200)
+        self.assertEqual(self.call('/api/helpers')[1]['helpers']['items'], ['Прогулка', 'Чай'])
+        self.assertEqual(restore(copy)[0], 200)
+        self.assertEqual(self.call('/api/helpers')[1]['helpers']['items'], ['Чай'])
+        self.assertEqual(self.call('/api/entries')[1]['entries'][0]['sleepHours'], 8)
+        legacy = dict(copy, formatVersion=2)
+        del legacy['helpers']
+        self.assertEqual(restore(legacy)[0], 200)
+        self.assertEqual(self.call('/api/helpers')[1]['helpers']['items'], ['Чай'])
+        malformed = dict(copy, helpers=[''])
+        self.assertEqual(self.call('/api/restore/preview', 'POST', {'backup': malformed})[0], 400)
+        # A list update invalidates a previously reviewed restore, just like a diary edit.
+        preview = self.call('/api/restore/preview', 'POST', {'backup': copy})[1]
+        current = self.call('/api/helpers')[1]['helpers']
+        helper(['Душ'], current['revision'])
+        self.assertEqual(self.call('/api/restore', 'POST', dict(backup=copy, mode='replace', expectedGeneration=preview['generation'], operationId=secrets.token_hex(16)))[0], 409)
 
 
 if __name__ == '__main__':

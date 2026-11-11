@@ -2,6 +2,8 @@ import { useState } from 'react';
 import { ArrowRight, Check, CloudRain, Footprints, Heart, Leaf, LoaderCircle, Music2, Pause, Play, Timer, Volume2, Waves, X } from 'lucide-react';
 import { soundNames, type Sound } from './ambience';
 import { clockLabel, type AmbienceControls } from './useAmbience';
+import HelpersPanel from './HelpersPanel';
+import type { HelpersControls } from './useHelpers';
 
 const sounds: { id: Sound; icon: typeof CloudRain; detail: string }[] = [
   { id: 'rain', icon: CloudRain, detail: 'Ровный шелест капель' },
@@ -15,7 +17,7 @@ const grounding = [
   { title: 'Один маленький шаг', text: 'Спросите себя: «Что сейчас сделает ближайшие десять минут чуть легче?» Выберите что-то небольшое и посильное.' },
 ];
 
-export default function CalmPage({ audio, onWrite }: { audio: AmbienceControls; onWrite: () => void }) {
+export default function CalmPage({ audio, helpers, onWrite }: { audio: AmbienceControls; helpers: HelpersControls; onWrite: () => void }) {
   const [step, setStep] = useState<number | null>(null);
   const [finished, setFinished] = useState(false);
   return <>
@@ -29,6 +31,7 @@ export default function CalmPage({ audio, onWrite }: { audio: AmbienceControls; 
       <div className="sound-timer"><span><Timer size={17} /> Выключить через</span><div role="group" aria-label="Таймер звука">{[5, 10, 20].map(value => <button type="button" key={value} disabled={audio.busy} className={audio.minutes === value ? 'selected' : ''} aria-pressed={audio.minutes === value} onClick={() => audio.changeTimer(value)}>{value} мин</button>)}</div></div>
       {audio.error && <p role="alert" className="error-text">{audio.error}</p>}<p className="sound-footnote">Фон создаётся на устройстве и работает без интернета после первого открытия. При новом открытии сайта звук сам не включается.</p>
     </section>
+    <HelpersPanel controls={helpers} />
     <section className="card grounding-card"><div className="card-title"><span className="section-icon sand"><Footprints size={20} /></span><h2>Вернуться к тому, что вокруг</h2></div>
       {step === null ? <><p className="muted">Когда мыслей слишком много, можно на минуту переключить внимание на опору, предметы и звуки рядом. Проходите шаги в удобном темпе.</p><button className="secondary" onClick={() => { setStep(0); setFinished(false); }}>Попробовать четыре шага <ArrowRight size={17} /></button></> : <div className="grounding-exercise" aria-live="polite"><div className="grounding-progress"><span>{finished ? 'Пауза завершена' : `Шаг ${step + 1} из ${grounding.length}`}</span><button className="icon-button" aria-label="Закончить упражнение" onClick={() => { setStep(null); setFinished(false); }}><X size={18} /></button></div><h3>{finished ? 'Пусть дальше будет чуть бережнее' : grounding[step].title}</h3><p>{finished ? 'Не нужно сразу решать всё. Можно остаться с тихим звуком или записать пару мыслей.' : grounding[step].text}</p><div className="grounding-actions">{finished ? <button className="secondary" onClick={onWrite}>Перейти к дневнику <ArrowRight size={17} /></button> : <button className="primary" onClick={() => step < grounding.length - 1 ? setStep(step + 1) : setFinished(true)}>{step === grounding.length - 1 ? <>Завершить <Check size={17} /></> : <>Дальше <ArrowRight size={17} /></>}</button>}{step > 0 && !finished && <button className="text-button" onClick={() => setStep(step - 1)}>Назад</button>}</div></div>}
       <p className="gentle-choice">Если этот способ не подходит, его можно пропустить.</p>

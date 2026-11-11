@@ -1,6 +1,7 @@
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -11,6 +12,10 @@ from urllib.parse import urlsplit
 
 ITERATIONS = 600_000
 ENTRY_KEYS = ('date', 'stress', 'mood', 'note', 'diary', 'meals')
+HELPERS_SCHEMA = '''CREATE TABLE IF NOT EXISTS helpers (
+  id INTEGER PRIMARY KEY CHECK(id=1), items TEXT NOT NULL, version INTEGER NOT NULL,
+  revision TEXT NOT NULL, mutation_id TEXT NOT NULL, updated_at TEXT NOT NULL
+);'''
 
 
 class Problem(Exception):
@@ -66,8 +71,8 @@ CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY CHECK(id=1), generation 
 INSERT OR IGNORE INTO meta(id,generation) VALUES(1,0);
 CREATE TABLE IF NOT EXISTS recovery_snapshots (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS restores (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL);
-PRAGMA user_version=1;
-'''
+PRAGMA user_version=2;
+''' + HELPERS_SCHEMA
 
 
 def initialize(directory, origin):
@@ -116,7 +121,7 @@ def prepare_setup(directory, origin):
         raise ValueError('Найдены неполные данные настройки. Файлы оставлены без изменений; требуется проверить папку данных.')
     config = json.loads(config_path.read_text(encoding='utf-8'))
     with closing(connect(directory)) as db, transaction(db):
-        if db.execute('PRAGMA user_version').fetchone()[0] != 1:
+        if db.execute('PRAGMA user_version').fetchone()[0] not in (1, 2):
             raise ValueError('Неподдерживаемая версия базы. Данные оставлены без изменений.')
         if db.execute('SELECT id FROM owner WHERE id=1').fetchone():
             return {'token': None, 'origin': config['origin'], 'existing': True, 'account_created': True}
@@ -148,6 +153,17 @@ def transaction(db):
         raise
 
 
+def migrate(db):
+    # Upgrade in place, in a single transaction, without replacing any diary data.
+    with transaction(db):
+        version = db.execute('PRAGMA user_version').fetchone()[0]
+        if version not in (1, 2):
+            raise RuntimeError('Неподдерживаемая версия базы. Нужна миграция.')
+        if version == 1:
+            db.execute(HELPERS_SCHEMA)
+            db.execute('PRAGMA user_version=2')
+
+
 def valid_date(value):
     try:
         return isinstance(value, str) and len(value) == 10 and dt.date.fromisoformat(value).isoformat() == value
@@ -159,12 +175,23 @@ def validate_entry(value):
     if not isinstance(value, dict) or not all(k in value for k in ENTRY_KEYS):
         raise Problem(400, 'В записи отсутствуют обязательные поля формата.')
     e = {k: value[k] for k in ENTRY_KEYS}
+    e.update(tags=value.get('tags', []), sleepHours=value.get('sleepHours'), energy=value.get('energy'))
     if not valid_date(e['date']):
         raise Problem(400, 'Неверная дата записи.')
     if e['stress'] is not None and (type(e['stress']) is not int or not 0 <= e['stress'] <= 10):
         raise Problem(400, 'Стресс должен быть от 0 до 10 или не отмечен.')
     if e['mood'] not in ('', 'great', 'good', 'neutral', 'sad', 'hard'):
         raise Problem(400, 'Неверное настроение.')
+    sleep = e['sleepHours']
+    if sleep is not None and (type(sleep) not in (int, float) or not math.isfinite(sleep) or not 0 <= sleep <= 24 or sleep * 2 != round(sleep * 2)):
+        raise Problem(400, 'Сон: от 0 до 24 часов с шагом полчаса, либо оставьте поле пустым.')
+    if e['energy'] is not None and (type(e['energy']) is not int or not 0 <= e['energy'] <= 10):
+        raise Problem(400, 'Энергия должна быть от 0 до 10 или не отмечена.')
+    if not isinstance(e['tags'], list) or len(e['tags']) > 10 or any(not isinstance(t, str) or not 1 <= len(t.strip()) <= 32 for t in e['tags']):
+        raise Problem(400, 'Можно добавить до 10 меток по 32 символа.')
+    e['tags'] = [t.strip() for t in e['tags']]
+    if len({t.casefold() for t in e['tags']}) != len(e['tags']):
+        raise Problem(400, 'Метки не должны повторяться.')
     for name, limit in [('note', 5000), ('diary', 50000)]:
         if not isinstance(e[name], str) or len(e[name]) > limit:
             raise Problem(400, 'Текст записи превышает допустимый размер.')
@@ -189,7 +216,9 @@ def validate_entry(value):
 
 
 def row_record(row):
-    return dict(json.loads(row['payload']), version=row['version'], revision=row['revision'],
+    payload = json.loads(row['payload'])
+    return dict(payload, tags=payload.get('tags', []), sleepHours=payload.get('sleepHours'), energy=payload.get('energy'),
+                version=row['version'], revision=row['revision'],
                 mutationId=row['mutation_id'], updatedAt=row['updated_at'])
 
 
@@ -206,11 +235,32 @@ def bump(db):
 
 
 def backup(db):
-    return {'format': 'tiho-backup', 'formatVersion': 2, 'exportedAt': now(), 'entries': all_records(db)}
+    helpers = get_helpers(db)
+    return {'format': 'tiho-backup', 'formatVersion': 3, 'exportedAt': now(), 'entries': all_records(db),
+            'helpers': helpers['items'] if helpers else []}
+
+
+def validate_helpers(items):
+    if not isinstance(items, list) or len(items) > 30 or any(not isinstance(t, str) or not 1 <= len(t.strip()) <= 200 for t in items):
+        raise Problem(400, 'В личном списке допустимо до 30 пунктов по 200 символов.')
+    return [t.strip() for t in items]
+
+
+def get_helpers(db):
+    row = db.execute('SELECT * FROM helpers WHERE id=1').fetchone()
+    return {'items': json.loads(row['items']), 'version': row['version'], 'revision': row['revision'],
+            'mutationId': row['mutation_id'], 'updatedAt': row['updated_at']} if row else None
+
+
+def put_helpers(db, items, mutation):
+    old = get_helpers(db)
+    db.execute('INSERT OR REPLACE INTO helpers VALUES(1,?,?,?,?,?)',
+               (json_text(items), old['version'] + 1 if old else 1, secrets.token_hex(16), mutation, now()))
+    return get_helpers(db)
 
 
 def validate_backup(value):
-    if not isinstance(value, dict) or value.get('format') != 'tiho-backup' or type(value.get('formatVersion')) is not int or value['formatVersion'] not in (1, 2):
+    if not isinstance(value, dict) or value.get('format') != 'tiho-backup' or type(value.get('formatVersion')) is not int or value['formatVersion'] not in (1, 2, 3):
         raise Problem(400, 'Это не резервная копия «Тихо» поддерживаемого формата JSON.')
     entries = value.get('entries')
     if not isinstance(entries, list) or len(entries) > 10000:
@@ -222,4 +272,4 @@ def validate_backup(value):
             raise Problem(400, 'В копии есть повторяющиеся даты. Восстановление отменено.')
         dates.add(entry['date'])
         result.append(entry)
-    return result
+    return {'entries': result, 'helpers': validate_helpers(value.get('helpers')) if value['formatVersion'] == 3 else None}

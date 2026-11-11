@@ -14,8 +14,8 @@ from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, urlsplit
 
 from .storage import (Problem, all_records, backup, bump, connect, data_directory, digest,
-                      generation, json_text, now, password_hash, row_record, transaction,
-                      validate_backup, validate_entry, valid_date)
+                      generation, get_helpers, json_text, migrate, now, password_hash, put_helpers, row_record, transaction,
+                      validate_backup, validate_entry, validate_helpers, valid_date)
 
 MAX_BODY = 32 * 1024 * 1024
 COOKIE = 'tiho_session'
@@ -33,8 +33,7 @@ class App:
         self.secure = self.origin.startswith('https://')
         # Verify the data file exists. Deploying/restarting never creates a replacement DB.
         with closing(connect(self.directory)) as db:
-            if db.execute('PRAGMA user_version').fetchone()[0] != 1:
-                raise RuntimeError('Неподдерживаемая версия базы. Нужна миграция.')
+            migrate(db)
 
     def __call__(self, env, start_response):
         status, headers = 200, []
@@ -196,6 +195,24 @@ class App:
             return {'ok': True}, 200, [self.cookie('', 0)]
         if path == '/api/entries' and method == 'GET':
             return {'entries': all_records(db)}, 200, []
+        if path == '/api/helpers':
+            if method == 'GET':
+                return {'helpers': get_helpers(db)}, 200, []
+            if method == 'PUT':
+                data = self.body(env)
+                items = validate_helpers(data.get('items'))
+                mutation = data.get('mutationId', '')
+                if not isinstance(mutation, str) or not TOKEN_RE.fullmatch(mutation):
+                    raise Problem(400, 'Неверный идентификатор операции.')
+                with transaction(db):
+                    old = get_helpers(db)
+                    if old and old['mutationId'] == mutation:
+                        return {'helpers': old}, 200, []
+                    if (old['revision'] if old else None) != data.get('revision'):
+                        raise Problem(409, 'На другом устройстве список уже изменён. Ваш черновик сохранён здесь.')
+                    result = put_helpers(db, items, mutation)
+                    bump(db)
+                return {'helpers': result}, 200, []
         if path.startswith('/api/entries/'):
             date = path.removeprefix('/api/entries/')
             if not valid_date(date):
@@ -228,22 +245,28 @@ class App:
                     result = row_record(db.execute('SELECT * FROM entries WHERE date=?', (date,)).fetchone())
                 return {'entry': result}, 200, []
         if path == '/api/backup' and method == 'GET':
-            return backup(db), 200, [('Content-Disposition', 'attachment; filename="tiho-backup.json"')]
+            with transaction(db):
+                result = backup(db)
+            return result, 200, [('Content-Disposition', 'attachment; filename="tiho-backup.json"')]
         if path in ('/api/restore/preview', '/api/restore') and method == 'POST':
             data = self.body(env)
-            entries = validate_backup(data.get('backup'))
+            checked = validate_backup(data.get('backup'))
+            entries, helpers = checked['entries'], checked['helpers']
             if path.endswith('/preview'):
                 with transaction(db):
                     dates = {r[0] for r in db.execute('SELECT date FROM entries')}
                     matching = sum(e['date'] in dates for e in entries)
+                    current_helpers = (get_helpers(db) or {}).get('items', [])
                     result = {'total': len(entries), 'existing': matching, 'new': len(entries) - matching,
                               'current': len(dates), 'generation': generation(db),
+                              'hasHelpers': helpers is not None, 'helperCount': len(helpers or []),
+                              'mergedHelperCount': len(dict.fromkeys(current_helpers + (helpers or []))),
                               'hasOldDrafts': bool(data['backup'].get('deviceDrafts'))}
                 return result, 200, []
             mode, operation = data.get('mode'), data.get('operationId', '')
             if mode not in ('merge', 'replace') or not isinstance(operation, str) or not TOKEN_RE.fullmatch(operation):
                 raise Problem(400, 'Неверный способ восстановления.')
-            fingerprint = digest(json_text({'mode': mode, 'entries': entries}))
+            fingerprint = digest(json_text({'mode': mode, 'entries': entries, 'helpers': helpers}))
             with transaction(db):
                 prior = db.execute('SELECT * FROM restores WHERE id=?', (operation,)).fetchone()
                 if prior:
@@ -252,6 +275,10 @@ class App:
                     return json.loads(prior['result']), 200, []
                 if type(data.get('expectedGeneration')) is not int or data['expectedGeneration'] != generation(db):
                     raise Problem(409, 'История изменилась после выбора файла. Выберите копию заново.')
+                helper_items = helpers
+                if helpers is not None and mode == 'merge':
+                    helper_items = list(dict.fromkeys((get_helpers(db) or {}).get('items', []) + helpers))
+                    validate_helpers(helper_items)
                 # The safety snapshot and replacement commit atomically with the restored entries.
                 db.execute('INSERT INTO recovery_snapshots(created_at,payload) VALUES(?,?)', (now(), json_text(backup(db))))
                 db.execute('DELETE FROM recovery_snapshots WHERE id NOT IN (SELECT id FROM recovery_snapshots ORDER BY id DESC LIMIT 3)')
@@ -266,8 +293,11 @@ class App:
                     db.execute('INSERT INTO entries VALUES(?,?,?,?,?,?)',
                                (entry['date'], json_text(entry), 1, secrets.token_hex(16), secrets.token_hex(16), now()))
                     restored += 1
+                if helper_items is not None:
+                    put_helpers(db, helper_items, secrets.token_hex(16))
                 bump(db)
-                result = {'restored': restored, 'skipped': skipped, 'generation': generation(db)}
+                result = {'restored': restored, 'skipped': skipped, 'generation': generation(db),
+                          'helpersRestored': len(helper_items) if helper_items is not None else None}
                 db.execute('INSERT INTO restores VALUES(?,?,?)', (operation, fingerprint, json_text(result)))
                 db.execute('DELETE FROM restores WHERE id NOT IN (SELECT id FROM restores ORDER BY rowid DESC LIMIT 100)')
             return result, 200, []

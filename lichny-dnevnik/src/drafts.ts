@@ -1,8 +1,8 @@
 import { siteId } from './auth';
-import type { Draft } from './model';
+import { entryOnly, type Draft } from './model';
 const key = (uid: string, date: string) => `tiho:draft:${siteId}:${uid}:${date}`;
 export function readDraft(uid: string, date: string): Draft | null {
-  try { const raw = localStorage.getItem(key(uid, date)); return raw ? JSON.parse(raw) : null; } catch { return null; }
+  try { const raw = localStorage.getItem(key(uid, date)); const draft = raw ? JSON.parse(raw) : null; return draft ? { ...draft, entry: entryOnly(draft.entry) } : null; } catch { return null; }
 }
 export function writeDraft(uid: string, draft: Draft): boolean {
   try { localStorage.setItem(key(uid, draft.entry.date), JSON.stringify(draft)); return true; } catch { return false; }

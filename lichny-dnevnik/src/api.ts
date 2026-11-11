@@ -17,8 +17,17 @@ export async function deleteEntry(_uid: string, date: string, revision: string) 
   await requestJson(`/api/entries/${date}`, { method: 'DELETE', body: JSON.stringify({ revision }) });
 }
 export const getBackup = () => requestJson('/api/backup');
-export type RestorePreview = { total: number; existing: number; new: number; current: number; generation: number; hasOldDrafts: boolean };
+export type RestorePreview = { total: number; existing: number; new: number; current: number; generation: number; hasOldDrafts: boolean; hasHelpers: boolean; helperCount: number; mergedHelperCount: number };
 export const previewBackup = (backup: unknown): Promise<RestorePreview> => requestJson('/api/restore/preview', { method: 'POST', body: JSON.stringify({ backup }) });
 export const restoreBackup = (backup: unknown, mode: string, generation: number, operationId: string) => requestJson('/api/restore', {
   method: 'POST', body: JSON.stringify({ backup, mode, expectedGeneration: generation, operationId }),
 });
+export type HelpersRecord = { items: string[]; revision: string; version: number; mutationId: string; updatedAt: string };
+export type HelpersDraft = { items: string[]; revision: string | null; mutationId: string };
+export const getHelpers = async (): Promise<HelpersRecord | null> => (await requestJson('/api/helpers')).helpers;
+export async function saveHelpers(draft: HelpersDraft): Promise<HelpersRecord> {
+  const current = await getHelpers();
+  if (current?.mutationId === draft.mutationId) return current;
+  if ((current?.revision || null) !== draft.revision) throw new ConflictError();
+  return (await requestJson('/api/helpers', { method: 'PUT', body: JSON.stringify(draft) })).helpers;
+}

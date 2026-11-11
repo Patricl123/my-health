@@ -7,10 +7,10 @@ export const moods: { value: Mood; label: string; face: string }[] = [
   { value: 'hard', label: 'Тяжело', face: '☂' },
 ];
 export type Meal = { id: string; time: string; description: string };
-export type Entry = { date: string; stress: number | null; mood: Mood; note: string; diary: string; meals: Meal[] };
+export type Entry = { date: string; stress: number | null; mood: Mood; note: string; diary: string; meals: Meal[]; tags: string[]; sleepHours: number | null; energy: number | null };
 export type RecordEntry = Entry & { version: number; revision: string; mutationId: string; updatedAt: string };
 export type Draft = { entry: Entry; revision: string | null; version: number; mutationId: string; touchedAt: string };
-export const emptyEntry = (date: string): Entry => ({ date, stress: null, mood: '', note: '', diary: '', meals: [] });
+export const emptyEntry = (date: string): Entry => ({ date, stress: null, mood: '', note: '', diary: '', meals: [], tags: [], sleepHours: null, energy: null });
 export const localDate = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 export function weekDates(end: string) {
   return Array.from({ length: 7 }, (_, i) => {
@@ -18,5 +18,6 @@ export function weekDates(end: string) {
   });
 }
 export const dateLabel = (date: string, options: Intl.DateTimeFormatOptions = { day: 'numeric', month: 'long' }) => new Date(`${date}T12:00:00`).toLocaleDateString('ru-RU', options);
-export const hasContent = (e: Entry) => e.stress !== null || !!(e.mood || e.note.trim() || e.diary.trim() || e.meals.length);
-export const entryOnly = (e: Entry): Entry => ({ date: e.date, stress: e.stress, mood: e.mood, note: e.note, diary: e.diary, meals: e.meals });
+export const hasContent = (e: Entry) => e.stress !== null || e.sleepHours !== null || e.energy !== null || !!(e.mood || e.note.trim() || e.diary.trim() || e.meals.length || e.tags.length);
+export const entryOnly = (e: Entry): Entry => ({ date: e.date, stress: e.stress, mood: e.mood, note: e.note, diary: e.diary, meals: e.meals, tags: e.tags || [], sleepHours: e.sleepHours ?? null, energy: e.energy ?? null });
+export const tagSuggestions = ['Работа', 'Семья', 'Отдых', 'Тяжёлый день', 'Прогулка', 'Друзья'];
